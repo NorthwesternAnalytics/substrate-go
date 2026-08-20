@@ -3,6 +3,7 @@ package trust
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // packageacl_requirement.go exposes the branch ACL through the SAME seam
@@ -104,4 +105,77 @@ func (r *ACLResolver) RequirePackageAccess(ctx context.Context, access *Access,
 		return nil, err
 	}
 	return packageAccessRequirement{min: min, have: have, nodeID: nodeID}, nil
+}
+
+// DecidePackageAccess judges a package-access requirement WITHOUT the
+// tenant-membership precondition that DecideFor applies first.
+//
+// # The defect this exists to fix, found by the INC-2 negative suite
+//
+// DecideFor refuses outright when !a.HasTenant(tenantID), before the
+// requirement is consulted at all. For every other Requirement that is
+// correct: a role or entitlement question is meaningless outside a tenant you
+// belong to. For THIS requirement it is wrong, and wrong in the disclosure
+// direction's opposite — it denies people the contract says are admitted.
+//
+// Decision 67c69f0f [12/12] pins the formula, and pins it as the one place a
+// naive reading of the sketch goes wrong:
+//
+//	readable(principal, node) = [member path: tenant membership AND branch-authz admits]
+//	                         OR [entry path: a live effective entry names this
+//	                            principal — member or NOT]
+//
+// It is an OR. DecideFor implements the AND of the left disjunct and then
+// short-circuits the whole expression, so a cross-tenant guest — the entire
+// point of the entry path, and how epic nw#1169 is absorbed rather than built
+// twice — is refused everything with reason tenant_not_licensed. That reason
+// is also simply untrue: nothing about a guest is a licensing fact.
+//
+// The resolver already computes the full OR. Effective() returns the guest
+// their capped level via the entry path, and INC-1's
+// TestReadableIsMemberPathOREntryPath proves it. So `have` arriving here has
+// ALREADY answered the question membership was standing in for, and applying
+// the membership gate on top of it is not a second safety check — it is a
+// second, contradictory, and less informed answer to a question that was
+// already answered correctly.
+//
+// # Why this is not a widening
+//
+// The only way to reach a level above none is for the resolver to have granted
+// it: a member through the member path, or a principal NAMED IN A LIVE ENTRY
+// through the entry path. Cross-tenant principals are independently capped at
+// comment (ccf3266a [2/12]) inside the resolver, so no outsider can reach a
+// write class here regardless of what any entry says. A principal with no
+// membership and no entry resolves to LevelNone and is refused by the
+// threshold, exactly as before — which is what TestAnUngrantedCrossTenant
+// PrincipalIsDeniedEVERYTHING asserts.
+//
+// ALTERNATIVE REJECTED: relaxing HasTenant inside decideForAt itself. That
+// would change the answer for RequireRole and RequireFeature too, where the
+// membership precondition is load-bearing and correct. One requirement kind
+// needed different treatment, so one requirement kind gets its own entry
+// point, and the general path is left exactly as it was.
+func DecidePackageAccess(a *Access, tenantID string, req Requirement) Decision {
+	return decidePackageAccessAt(a, tenantID, req, time.Now().UTC())
+}
+
+func decidePackageAccessAt(a *Access, tenantID string, req Requirement, now time.Time) Decision {
+	if a == nil {
+		return denial(req, "", ReasonTenantNotLicensed,
+			"this account has no access to the requested organisation",
+			"sign in again, or ask an administrator for access", now)
+	}
+	// A requirement of any OTHER kind reaching this function is a
+	// mis-wiring, and it falls back to the ordinary path rather than
+	// silently receiving the relaxed treatment. The relaxation is for
+	// package access alone and must never become a way around the membership
+	// gate for role and entitlement questions.
+	if _, ok := req.(packageAccessRequirement); !ok {
+		return decideForAt(a, tenantID, req, now)
+	}
+	if req.satisfiedBy(a, tenantID) {
+		return allowed(req, tenantID, now)
+	}
+	return denial(req, tenantID, req.deniedReason(),
+		req.deniedExplanation(), req.deniedRemediation(), now)
 }
