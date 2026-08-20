@@ -772,3 +772,48 @@ func (r *ACLResolver) putMemo(key string, g EffectiveGrant) {
 	defer r.mu.Unlock()
 	r.levels[key] = g
 }
+
+// ─── the enforcement short-circuit (INC-2, nw#3059) ──────────────────────
+
+// Restricted reports whether this tenant has any ACL rows at all — the one
+// boolean the ship-day guarantee rides on (c8f0cd3d [8/12]).
+//
+// Exported in INC-2 because ENFORCEMENT needs to ask the question before it
+// does any work, and INC-1 only needed it inside the resolver. False means
+// the enforcement middleware skips every lookup it would otherwise do — no
+// item-to-package resolution, no container member scan, no ReadableSet — and
+// the request reaches its handler on exactly the path it took before this
+// feature existed. Cached per request, so asking is free after the first.
+func (r *ACLResolver) Restricted(ctx context.Context, tenantID string) (bool, error) {
+	return r.restricted(ctx, tenantID)
+}
+
+// AnyRestricted reports whether ANY tenant in the caller's scope is
+// restricted.
+//
+// This is the gate the enforcement seam actually asks, and the quantifier is
+// the whole of it. A request is scoped to the tenants the caller belongs to
+// (after focus), and enforcement must engage if even ONE of them has ACL
+// rows: skipping because the others are empty would leave the restricted one
+// unenforced, which is the failure this feature exists to prevent. So: ANY,
+// never ALL, and an error is reported rather than swallowed — a presence
+// check that failed is not a presence check that said "no".
+//
+// The cost on the unrestricted path is one cached existence check per tenant
+// in scope, which for the overwhelmingly common single-tenant request is the
+// one query P4 permits.
+func (r *ACLResolver) AnyRestricted(ctx context.Context, tenantIDs []string) (bool, error) {
+	for _, id := range tenantIDs {
+		if id == "" {
+			continue
+		}
+		restricted, err := r.restricted(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		if restricted {
+			return true, nil
+		}
+	}
+	return false, nil
+}
