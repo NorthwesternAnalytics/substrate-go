@@ -222,6 +222,15 @@ const (
 	// ViaTenantOwnerFloor — the tenant owner/admin floor, which no break can
 	// cut off. A distinct audit reason by ruling (ccf3266a [2/12]).
 	ViaTenantOwnerFloor = "tenant_owner_floor"
+	// ViaPackageManagerFloor — the node's NAMED MANAGER holds admin on it
+	// implicitly (Director ruling 09ee1bb3 on nw#3059). A distinct reason for
+	// the same purpose as the tenant-owner floor's: "why can X see this" must
+	// never answer "an entry" when there is no entry to point at. The two
+	// floors differ in reach, and the difference is the whole of it — the
+	// tenant floor is applied last and beats every break; this one is part of
+	// direct(node), so it is absolute on the package it names and inherits
+	// downward like any other grant.
+	ViaPackageManagerFloor = "package_manager_floor"
 	// ViaTenantMemberDefault — the implicit tenant-root grant every member
 	// holds until an owner restricts something. See implicitRootLevel.
 	ViaTenantMemberDefault = "tenant_member_default"
@@ -351,6 +360,74 @@ func (r *ACLResolver) walkFrom(ctx context.Context, tenantID, nodeID string,
 	}
 
 	node, known := r.nodeOf(tenantID, nodeID)
+
+	// THE PACKAGE-MANAGER FLOOR — Director ruling 09ee1bb3 on nw#3059.
+	//
+	// A package's named manager holds admin on it, implicitly. This is a
+	// USERSET RELATION evaluated here, never an ACL row: nothing is written
+	// when a manager is named, nothing has to be rewritten when the manager
+	// changes, and no permissions page can show a grant that is a property of
+	// the graph rather than of a table.
+	//
+	// WHY IT EXISTS AT ALL. The same reason an operating system gives an
+	// object's owner full control: a restriction the manager did not set must
+	// not lock the manager out of their own package. Without it, an
+	// administrator breaking inheritance on a portfolio would silently
+	// evict the manager of a project underneath it from a package they are
+	// accountable for, with no error, no audit line and no route back except
+	// asking somebody with tenant admin. That is the unrecoverable-state
+	// class the tenant-owner floor already refuses to enter, one rung down.
+	//
+	// WHY IT IS PART OF direct(node) AND NOT APPLIED LAST like the
+	// tenant-owner floor. Because "and its descendants" has to mean something
+	// precise, and inheritance is what already means it. Sitting in direct(),
+	// the floor:
+	//
+	//   - holds ABSOLUTELY on the managed node, because a node's own direct
+	//     grants are never cut by its own inherit flag — which is exactly the
+	//     lockout case;
+	//   - FLOWS DOWN to descendants that inherit, so managing a program
+	//     reaches its projects;
+	//   - is CUT by a break below the managed node, like every other
+	//     inherited grant — a project that has broken inheritance keeps its
+	//     own manager's floor and stops taking the program manager's.
+	//
+	// Applying it last, as an override, would have given a portfolio manager
+	// admin on a broken branch underneath them, which is the opposite of what
+	// breaking inheritance was asked to do.
+	//
+	// IT REQUIRES TENANT MEMBERSHIP, and that condition is doing two jobs.
+	//
+	// The first is meaning: the floor exists so the person ACCOUNTABLE for a
+	// package cannot be locked out of it, and accountability is something a
+	// member of the tenant holds. A cross-tenant guest who is somehow named
+	// as a manager is a guest; if they are to reach the package, an explicit
+	// entry says so, visibly, on a permissions page.
+	//
+	// The second is that WITHOUT it the unrestricted short-circuit would
+	// diverge from the full path, and TestShortCircuitAgreesWithTheFullPath
+	// would be right to fail. On a tenant with zero ACL rows a member already
+	// resolves to admin (implicitRootLevel), so a member manager gets the
+	// same answer down either path; a NON-member would get LevelNone from the
+	// short-circuit and comment (floor, capped cross-tenant) from the walk.
+	// Making the short-circuit consult node facts to fix that would put a
+	// store read on the path P4 budgets at one cached existence check.
+	// Restricting the floor to members costs nothing real and keeps the
+	// optimisation honest, which is the trade worth taking.
+	//
+	// The AGENT CAP still applies, because it is a conjunct outside this
+	// algebra: an agent acting for a manager cannot exceed the manager, which
+	// is the safe direction and a property of the caller, not the package.
+	if known && node.ManagerID != "" &&
+		p.has(PrincipalPerson, node.ManagerID) && p.isTenantMember() {
+		if Max(best.Level, LevelAdmin) != best.Level {
+			best = EffectiveGrant{
+				Level: LevelAdmin, Via: ViaPackageManagerFloor,
+				SourceNodeID: nodeID,
+			}
+		}
+	}
+
 	// A node the store does not know about is treated as a root that
 	// inherits: unknown structure must not silently BREAK inheritance, which
 	// would narrow somebody because of a missing row.
@@ -398,6 +475,16 @@ type principalSet struct {
 
 func (p principalSet) has(kind PrincipalKind, id string) bool {
 	return p.keys[principalKey(kind, id)]
+}
+
+// isTenantMember reports whether this caller is a member of the tenant the
+// set was expanded for.
+//
+// Read off the all-tenant-members class rather than carried separately,
+// because principalsFor admits that class EXACTLY when access.HasTenant is
+// true — so the two can never disagree, which a second field could.
+func (p principalSet) isTenantMember() bool {
+	return p.has(PrincipalClass, ClassAllTenantMembers)
 }
 
 // principalsFor expands a caller: themselves, their groups, and the virtual

@@ -287,6 +287,15 @@ type NodeACL struct {
 	// three-valued flag would give every caller of this struct a chance to
 	// get the default wrong in its own way.
 	Inherit bool
+	// ManagerID is the person id of this node's NAMED MANAGER, or empty.
+	//
+	// It is a FACT the app reports, exactly like ParentIDs — who manages a
+	// package is the app's own record — and the resolver turns it into a
+	// grant. That split is the same one the whole seam is built on: the app
+	// may report facts, only trust may decide outcomes. See the manager
+	// floor in packageacl_resolver.go for what the resolver does with it and
+	// why it is not an entry.
+	ManagerID string
 }
 
 // PackageACLStore is the app-side seam: the four facts the evaluator needs
