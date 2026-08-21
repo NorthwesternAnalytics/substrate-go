@@ -423,3 +423,71 @@ func TestTheEntryPathIsNotVetoedByTenantMembership(t *testing.T) {
 			"the membership gate for role and entitlement questions")
 	}
 }
+
+// THE NEGATIVE HALF THE DIRECTOR ASKED FOR (review e15d09b2, ruling (a)).
+//
+// TestTheEntryPathIsNotVetoedByTenantMembership above proves that a
+// cross-tenant guest WITH an entry is admitted. On its own that test is
+// readable — wrongly — as "DecidePackageAccess lets guests bypass tenancy".
+// It does not, and the difference is the entire safety of the fix: what was
+// removed is a membership veto applied BEFORE the requirement was consulted,
+// not the requirement itself. Reaching any level above none still requires
+// the RESOLVER to have granted it, through the member path or the entry path.
+//
+// So this asserts the other side. A non-member with NO entry resolves to
+// LevelNone and is refused by BOTH functions. If somebody ever widens
+// DecidePackageAccess into an actual bypass, this is the test that fails —
+// and without it, the only symptom would be an outsider quietly seeing
+// everything, which is the failure mode that surfaces years later.
+func TestANonMemberWithNoEntryIsStillRefusedByBothPaths(t *testing.T) {
+	f := &fakeACLStore{
+		nodes:    aclSealedTree(),
+		presence: true,
+		// Deliberately NOT empty: there IS a live entry on the node, it just
+		// names somebody else. An empty entry map would also pass this test
+		// while proving less — it would leave open whether the refusal came
+		// from "no entry for you" or from "no entries at all", and only the
+		// first is the property being claimed.
+		entries: map[string][]ACLEntry{
+			"project": {aclEntryOf("e1", "project", PrincipalPerson, "someone-else", LevelAdmin)},
+		},
+	}
+
+	outsider := aclOutsider("nobody")
+
+	// The resolver is where the OR actually lives, so it is where the
+	// refusal has to originate. Assert that first: if this ever returns
+	// anything above none, the two Decide assertions below would be testing
+	// a threshold rather than the formula.
+	have := aclResolve(t, f, outsider, "project")
+	if have != LevelNone {
+		t.Fatalf("a non-member with no entry resolved %q, want %q — the resolver is admitting "+
+			"somebody through neither the member path nor the entry path, which is a widening "+
+			"of 67c69f0f's formula itself and not merely of the decision seam", have, LevelNone)
+	}
+
+	req := RequirePackageAccess(LevelRead, have)
+
+	if d := DecideFor(outsider, testTenant, req); d.Allowed() {
+		t.Error("DecideFor ALLOWED a non-member with no entry")
+	}
+
+	// The one that matters. DecidePackageAccess drops the membership
+	// precondition, so if the threshold check were also wrong this is where
+	// an outsider would walk in.
+	if d := DecidePackageAccess(outsider, testTenant, req); d.Allowed() {
+		t.Errorf("DecidePackageAccess ALLOWED a non-member holding %q on a READ requirement.\n"+
+			"    The fix removed a membership VETO that ran before the requirement was consulted; "+
+			"it did not remove the requirement. A principal the resolver grants nothing to must be "+
+			"refused by the threshold, exactly as before — otherwise this is a bypass and not an OR.", have)
+	}
+
+	// And at every other class too, so the test cannot pass because read
+	// happens to be special-cased somewhere.
+	for _, min := range []Level{LevelComment, LevelReadWrite, LevelAdmin} {
+		r := RequirePackageAccess(min, have)
+		if d := DecidePackageAccess(outsider, testTenant, r); d.Allowed() {
+			t.Errorf("DecidePackageAccess ALLOWED a non-member with no entry at %q", min)
+		}
+	}
+}
