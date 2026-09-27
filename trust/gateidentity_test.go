@@ -502,3 +502,37 @@ func TestGate_BearerStillAdmitsWithAGarbageAssertion(t *testing.T) {
 		})
 	}
 }
+
+func TestGate_AContextREFUSALIsNotAnOutage(t *testing.T) {
+	// FOUND BY nw#4438's END-TO-END TEST, which is the only place the two halves
+	// meet. DexID answers one 404 for an unknown principal, a revoked key and a
+	// person in no tenant this app serves — an ANSWER, not a failure. Reporting it
+	// as 503 tells the caller to retry something that will never succeed and reads
+	// as an incident in every dashboard.
+	//
+	// A genuine outage must still be 503, so both are asserted here: the pair is
+	// the point, and either one alone would pass on a gate that answered the same
+	// thing to everything.
+	d := newDexIDStub(t)
+
+	refusing := gateOnlyGate(t, d, GateContextResolverFunc(func(context.Context, GateIdentity) (*Access, error) {
+		return nil, ErrGateContextRefused
+	}))
+	w := httptest.NewRecorder()
+	refusing.Protect(okHandler()).ServeHTTP(w, gateRequest(d.mint(t, nil)))
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("a context REFUSAL = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), CodeNotAuthenticated) {
+		t.Errorf("body = %q, want the ordinary not-authenticated refusal", w.Body.String())
+	}
+
+	outage := gateOnlyGate(t, d, GateContextResolverFunc(func(context.Context, GateIdentity) (*Access, error) {
+		return nil, context.DeadlineExceeded
+	}))
+	w = httptest.NewRecorder()
+	outage.Protect(okHandler()).ServeHTTP(w, gateRequest(d.mint(t, nil)))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("a genuine outage = %d, want 503: the caller did nothing wrong", w.Code)
+	}
+}

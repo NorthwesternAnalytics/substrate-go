@@ -103,7 +103,24 @@ func (g *Gate) authenticateGate(w http.ResponseWriter, r *http.Request) (*Access
 	}
 
 	access, err := g.gateContext.ResolveFor(r.Context(), *id)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrGateContextRefused):
+		// A REFUSAL IS NOT AN OUTAGE (found by nw#4438's end-to-end test). The
+		// identity plane answered, and its answer is "not for this app" — an
+		// unknown principal, a revoked key, or a person in no tenant this app
+		// serves. 503 would tell the caller to retry something that will never
+		// succeed and would read as an incident in every dashboard; the honest
+		// answer is the same non-revealing 401 every other gate failure gets, so a
+		// caller learns only that it is not signed in here.
+		g.log.Warn("gate context refused", "person_id", id.PersonID, "kid", id.KeyID)
+		g.refuse(w, r, Refusal{
+			Status: http.StatusUnauthorized, Code: CodeNotAuthenticated,
+			Message: "sign in required",
+		})
+		return nil, true
+	case err != nil:
+		// Anything else IS an outage: unreachable, malformed, a bad status. The
+		// caller did nothing wrong and retrying is the right advice.
 		g.log.Warn("gate context unavailable", "error", err, "person_id", id.PersonID)
 		g.refuse(w, r, Refusal{
 			Status: http.StatusServiceUnavailable, Code: CodeContextUnavailable,
