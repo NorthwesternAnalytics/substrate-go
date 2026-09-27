@@ -34,7 +34,8 @@
 //
 // # How an app adopts it
 //
-// Build a Gate once at startup and wrap every route with it:
+// Build a Gate once at startup, enumerate the deliberately public surface,
+// and register every route through GateMux:
 //
 //	gate := trust.NewGate(trust.GateConfig{
 //		Validator:  trust.NewValidator(jwksURL, issuer),
@@ -43,13 +44,24 @@
 //		Refuse:     myApp.writeRefusal, // keep your own error envelope
 //	})
 //
-//	mux.Handle("GET /v1/things", gate.Protect(things.List))
-//	mux.Handle("DELETE /v1/things/{id}", gate.Protect(things.Delete, adminOnly))
+//	mux := trust.NewGateMux(gate, "GET /health", "OPTIONS /")
+//	mux.Public("GET /health", health)
+//	mux.Public("OPTIONS /", preflight)
+//	mux.Gated("GET /v1/things", things.List)
+//	mux.Gated("DELETE /v1/things/{id}", things.Delete, adminOnly)
+//	if err := mux.Validate(); err != nil {
+//		return err
+//	}
 //
 // Handlers then read the caller with trust.FromContext(r.Context()) and scope
 // their queries with access.TenantIDs(). A handler that needs a decision the
 // route table cannot express — because it depends on the request body — calls
 // trust.DecideFor directly with the tenant the body named.
+//
+// GateMux keeps its underlying http.ServeMux private. The only registration
+// verbs are Gated and Public; Public refuses any pattern not enumerated by the
+// constructor, and Routes returns immutable metadata for an adopting API's
+// build-time conformance walk.
 //
 // # Where this module lives
 //
