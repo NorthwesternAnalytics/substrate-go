@@ -129,7 +129,20 @@ func (c *DexIDClient) FetchContext(ctx context.Context, bearerToken string) (*Ac
 	// NOTHING IS CACHED ON A FAILURE PATH. A refusal or an outage must be
 	// re-asked on the next request, never remembered: caching a denial is how
 	// a restored membership fails to take effect.
-	access := Access{
+	access := accessFromContextBody(body)
+	c.cache.put(bearerToken, access)
+	return &access, nil
+}
+
+// accessFromContextBody is the ONE translation from DexID's context document into
+// an Access.
+//
+// EXTRACTED BECAUSE TWO DOORS NOW REACH THE SAME DOCUMENT (nw#4424): a person's
+// own /v1/me/context, and the service route a gate-authenticated request needs.
+// Two translations would be two readings of one document, and a field added to the
+// document would reach whichever of them somebody remembered.
+func accessFromContextBody(body meContextBody) Access {
+	return Access{
 		PersonID:      body.PersonID,
 		DisplayName:   body.DisplayName,
 		Tenants:       body.Tenants,
@@ -138,8 +151,6 @@ func (c *DexIDClient) FetchContext(ctx context.Context, bearerToken string) (*Ac
 		OwnerPersonID: body.OwnerPersonID,
 		PrincipalIDs:  body.PrincipalIDs,
 	}
-	c.cache.put(bearerToken, access)
-	return &access, nil
 }
 
 // CacheStats reports hits and misses since start, for a health endpoint or a
