@@ -122,31 +122,51 @@ type GateConfig struct {
 	// being a rollback of the release that carried it. It is not a
 	// configuration to sit in: a gate in observe mode enforces nothing.
 	Observe bool
+	// Assertions admits DexID GATE IDENTITY: a request with no Bearer token but
+	// a valid X-DexID-Assertion authenticates as that person (nw#4423).
+	//
+	// NIL MEANS GATE HEADERS ARE IGNORED, exactly as before this existed — not
+	// trusted, not reported as an attempt, simply not a way in. A deployment that
+	// has not turned this on behaves as it did yesterday.
+	Assertions *AssertionVerifier
+
+	// GateContext resolves what a gate-authenticated person may reach.
+	//
+	// REQUIRED WHENEVER Assertions IS SET, and the gate refuses gate identity
+	// without it rather than admitting a person it cannot scope. It is a seam
+	// because DexID has no service-to-service context route yet — see
+	// GateContextResolver (nw#4423 seq 16243).
+	GateContext GateContextResolver
+
 	// Now overrides the clock, for tests.
 	Now func() time.Time
 }
 
 // Gate is the composed middleware: authenticate, resolve, narrow, decide.
 type Gate struct {
-	validator  *Validator
-	dexid      *DexIDClient
-	requireMFA bool
-	refuse     RefusalWriter
-	log        *slog.Logger
-	observe    bool
-	now        func() time.Time
+	validator   *Validator
+	dexid       *DexIDClient
+	requireMFA  bool
+	refuse      RefusalWriter
+	log         *slog.Logger
+	observe     bool
+	now         func() time.Time
+	assertions  *AssertionVerifier
+	gateContext GateContextResolver
 }
 
 // NewGate builds a Gate. Build one per process and share it.
 func NewGate(cfg GateConfig) *Gate {
 	g := &Gate{
-		validator:  cfg.Validator,
-		dexid:      cfg.DexID,
-		requireMFA: cfg.RequireMFA,
-		refuse:     cfg.Refuse,
-		log:        cfg.Logger,
-		observe:    cfg.Observe,
-		now:        cfg.Now,
+		validator:   cfg.Validator,
+		dexid:       cfg.DexID,
+		requireMFA:  cfg.RequireMFA,
+		refuse:      cfg.Refuse,
+		log:         cfg.Logger,
+		observe:     cfg.Observe,
+		now:         cfg.Now,
+		assertions:  cfg.Assertions,
+		gateContext: cfg.GateContext,
 	}
 	if g.refuse == nil {
 		g.refuse = WriteRefusal
@@ -178,6 +198,18 @@ func (g *Gate) Protect(next http.HandlerFunc, reqs ...Requirement) http.Handler 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := r.Header.Get("Authorization")
 		if !strings.HasPrefix(header, "Bearer ") {
+			// GATE IDENTITY, only where there is no token of the caller's own
+			// (nw#4423). A request carrying BOTH a Bearer and gate headers
+			// authenticates by Bearer and the gate headers are ignored: the wall
+			// strips them on the native-bearer path anyway, and preferring the
+			// weaker of two presented credentials would be the wrong instinct.
+			if access, handled := g.authenticateGate(w, r); handled {
+				if access == nil {
+					return // authenticateGate wrote the refusal
+				}
+				g.runProtected(w, r, access.WithTenantFocus(ReadTenantFocus(r)), next, reqs)
+				return
+			}
 			g.refuse(w, r, Refusal{
 				Status: http.StatusUnauthorized, Code: CodeNotAuthenticated,
 				Message: "sign in required",
@@ -234,6 +266,10 @@ func (g *Gate) Protect(next http.HandlerFunc, reqs ...Requirement) http.Handler 
 		// call on the caller's own behalf without this service holding a
 		// service credential -- see Access.BearerToken.
 		access.BearerToken = token
+		access.AuthKind = AuthBearer
+		// The assurance level the Gate just judged, carried so an audit record
+		// says what it was rather than only that it passed.
+		access.AAL = claims.AAL
 
 		// TENANT FOCUS, APPLIED ONCE, HERE.
 		//
@@ -246,38 +282,53 @@ func (g *Gate) Protect(next http.HandlerFunc, reqs ...Requirement) http.Handler 
 		// available to make.
 		access = access.WithTenantFocus(ReadTenantFocus(r))
 
-		for _, req := range reqs {
-			decision := decideAt(access, req, g.now())
-			if decision.Allowed() {
-				continue
-			}
-			if g.observe {
-				g.log.Warn("trust gate would have refused (observe mode)",
-					"requirement", decision.Requirement, "reason", decision.ReasonCode,
-					"person_id", access.PersonID, "is_agent", access.IsAgent,
-					"method", r.Method, "path", r.URL.Path)
-				continue
-			}
-			// Warn, not debug: unlike an expired token, a role or
-			// entitlement refusal is either a real attempt to exceed
-			// authority or a misconfigured grant, and both deserve to be
-			// findable in a log without turning debug on.
-			g.log.Warn("trust gate refused",
+		g.runProtected(w, r, access, next, reqs)
+	})
+}
+
+// runProtected evaluates this route's requirements against an already
+// authenticated, already focused Access and dispatches or refuses.
+//
+// EXTRACTED SO BOTH AUTHENTICATION PATHS SHARE IT, not for tidiness. Bearer and
+// gate identity must be judged by the SAME requirements, in the same order, with
+// the same observe-mode behaviour; a second copy of this loop is how the newer
+// path quietly ends up skipping a check nobody notices for a year — which is the
+// exact failure this package's doc comment was written about.
+func (g *Gate) runProtected(w http.ResponseWriter, r *http.Request, access *Access,
+	next http.HandlerFunc, reqs []Requirement) {
+	for _, req := range reqs {
+		decision := decideAt(access, req, g.now())
+		if decision.Allowed() {
+			continue
+		}
+		if g.observe {
+			g.log.Warn("trust gate would have refused (observe mode)",
 				"requirement", decision.Requirement, "reason", decision.ReasonCode,
 				"person_id", access.PersonID, "is_agent", access.IsAgent,
-				"tenant_id", decision.TenantID,
+				"auth_kind", access.AuthKind,
 				"method", r.Method, "path", r.URL.Path)
-			g.refuse(w, r, Refusal{
-				Status:   decision.HTTPStatus(),
-				Code:     decision.ReasonCode,
-				Message:  decision.Explanation,
-				Decision: &decision,
-			})
-			return
+			continue
 		}
+		// Warn, not debug: unlike an expired token, a role or
+		// entitlement refusal is either a real attempt to exceed
+		// authority or a misconfigured grant, and both deserve to be
+		// findable in a log without turning debug on.
+		g.log.Warn("trust gate refused",
+			"requirement", decision.Requirement, "reason", decision.ReasonCode,
+			"person_id", access.PersonID, "is_agent", access.IsAgent,
+			"auth_kind", access.AuthKind,
+			"tenant_id", decision.TenantID,
+			"method", r.Method, "path", r.URL.Path)
+		g.refuse(w, r, Refusal{
+			Status:   decision.HTTPStatus(),
+			Code:     decision.ReasonCode,
+			Message:  decision.Explanation,
+			Decision: &decision,
+		})
+		return
+	}
 
-		next.ServeHTTP(w, r.WithContext(NewContext(r.Context(), access)))
-	})
+	next.ServeHTTP(w, r.WithContext(NewContext(r.Context(), access)))
 }
 
 // WriteRefusal is the default RefusalWriter: a

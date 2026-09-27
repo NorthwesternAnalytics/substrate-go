@@ -74,6 +74,26 @@ type Access struct {
 	// self-service tenant roster, which is a per-caller-visibility endpoint
 	// rather than a service-to-service one.
 	BearerToken string
+
+	// AuthKind is HOW this caller was authenticated: their own Supabase token, or
+	// a signed DexID identity assertion arriving through the login wall (nw#4423).
+	//
+	// Recorded so an audit event says which path a request came in on rather than
+	// leaving a reader to infer it from the absence of a token. Empty on an Access
+	// a service built itself, which is neither.
+	AuthKind AuthKind
+
+	// VerifyClass and AssertionKeyID are the gate path's provenance: which wall
+	// decision produced this identity, and which key signed it. For logs and
+	// audit only — nothing decides on them, and AssertionKeyID exists so a
+	// rotation can be traced through the records it produced.
+	VerifyClass    string
+	AssertionKeyID string
+
+	// AAL is the assurance level the identity plane reported. On the Bearer path
+	// the Gate checks it against RequireMFA before this Access exists; on the gate
+	// path it comes from the signed assertion.
+	AAL string
 }
 
 // IsOwnWork reports whether authorID belongs to this caller's ownership
