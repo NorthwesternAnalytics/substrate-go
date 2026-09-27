@@ -12,6 +12,8 @@ package trust
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -344,5 +346,159 @@ func TestGate_TenantFocusNarrowsTheGatePathToo(t *testing.T) {
 	gate.Protect(handler.ServeHTTP).ServeHTTP(httptest.NewRecorder(), r)
 	if len(seen) != 1 || seen[0] != "tenant-2" {
 		t.Errorf("TenantIDs() = %v, want just the focused tenant", seen)
+	}
+}
+
+// ── Bearer precedence and non-consumption (nw#4423 seq 16285) ───────────────
+//
+// THE CASE MY FIRST SUBMISSION CLAIMED AND DID NOT TEST. I wrote "a request with
+// both a Bearer and gate headers authenticates by Bearer" from reading the code —
+// authenticateGate sits inside the `!HasPrefix(header, "Bearer ")` branch, so it
+// cannot be reached — and the architect's approval repeated it before their own
+// correction caught that no test sent both credentials (seq 16282). "True by
+// reading" is what this lane does not accept from anyone else.
+//
+// NON-CONSUMPTION IS THE HALF THAT MATTERS. That the Bearer wins is one
+// assertion; that the gate path was never ENTERED is another, and only the second
+// rules out a gate that verifies the assertion, burns its jti in the replay cache
+// and then discards the result. A person's browser-through-the-wall request
+// arriving moments later with that same assertion would be refused as a replay,
+// which is an outage nobody would trace back to here.
+
+// bearerAndGateServer wires a Gate with BOTH paths configured, in front of a
+// handler that records what it saw.
+func bearerAndGateServer(t *testing.T, d *dexidStub) (*httptest.Server, string, *int, func() *Access) {
+	t.Helper()
+	jwks := newTestJWKS(t)
+	dexid := newFakeDexID(t, meContextBody{
+		PersonID:      "8f7c2b1a-0000-4000-8000-000000000001",
+		DisplayName:   "Bearer Person",
+		OwnerPersonID: "8f7c2b1a-0000-4000-8000-000000000001",
+		PrincipalIDs:  []string{"8f7c2b1a-0000-4000-8000-000000000001"},
+		Tenants:       []TenantMembership{{TenantID: "tenant-1", Role: "member"}},
+	})
+
+	resolverCalls := 0
+	gate := NewGate(GateConfig{
+		Validator: NewValidator(jwks.server.URL, testIssuer),
+		DexID:     NewDexIDClientWith(dexid.server.URL, "app", DexIDOptions{ContextTTL: -1}),
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+
+		Assertions: verifierFor(t, d),
+		GateContext: GateContextResolverFunc(func(context.Context, GateIdentity) (*Access, error) {
+			resolverCalls++
+			return gateAccess(), nil
+		}),
+	})
+
+	var seen *Access
+	srv := httptest.NewServer(gate.Protect(func(w http.ResponseWriter, r *http.Request) {
+		seen = FromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, jwks.mint(t, nil), &resolverCalls, func() *Access { return seen }
+}
+
+// bothCredentials sends a Bearer token AND the gate headers on one request.
+func bothCredentials(t *testing.T, srv *httptest.Server, bearer, assertion string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/thing", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set(HeaderPersonID, assertPerson)
+	req.Header.Set(HeaderIssuer, assertExtIss)
+	req.Header.Set(HeaderSubject, assertSubject)
+	req.Header.Set(HeaderAAL, "aal2")
+	if assertion != "" {
+		req.Header.Set(HeaderAssertion, assertion)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func TestGate_BearerWinsAndTheAssertionIsNotConsumed(t *testing.T) {
+	d := newDexIDStub(t)
+	srv, bearer, resolverCalls, seen := bearerAndGateServer(t, d)
+	assertion := d.mint(t, nil)
+
+	resp := bothCredentials(t, srv, bearer, assertion)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	access := seen()
+	if access == nil {
+		t.Fatal("the handler never ran")
+	}
+	// The BEARER's person, not the assertion's.
+	if access.PersonID != "8f7c2b1a-0000-4000-8000-000000000001" {
+		t.Errorf("PersonID = %q, want the Bearer token's subject", access.PersonID)
+	}
+	if access.PersonID == assertPerson {
+		t.Error("the assertion's person won over the Bearer token's")
+	}
+	if access.AuthKind != AuthBearer {
+		t.Errorf("AuthKind = %q, want %q", access.AuthKind, AuthBearer)
+	}
+	if access.BearerToken == "" {
+		t.Error("the Bearer path did not stash the caller's token")
+	}
+	// THE GATE PATH WAS NEVER ENTERED.
+	if *resolverCalls != 0 {
+		t.Errorf("the gate context resolver was called %d times on a Bearer request", *resolverCalls)
+	}
+	// And the assertion's jti was not burned: presenting it on its own still
+	// works, which is what proves it was not verified-and-discarded.
+	gateOnly := gateOnlyGate(t, d, GateContextResolverFunc(func(context.Context, GateIdentity) (*Access, error) {
+		return gateAccess(), nil
+	}))
+	w := httptest.NewRecorder()
+	gateOnly.Protect(okHandler()).ServeHTTP(w, gateRequest(assertion))
+	if w.Code != http.StatusOK {
+		t.Errorf("the same assertion on its own = %d (%s), want 200: the Bearer request consumed it",
+			w.Code, w.Body.String())
+	}
+}
+
+func TestGate_BearerStillAdmitsWithAGarbageAssertion(t *testing.T) {
+	// A forged or stale assertion riding along on a Bearer request must not refuse
+	// it. The wall strips these headers on the native-bearer path anyway, so
+	// anything arriving here is either a misconfigured proxy or someone trying —
+	// and in both cases the Bearer token is the credential that was presented.
+	d := newDexIDStub(t)
+	other := newDexIDStub(t)
+
+	for name, assertion := range map[string]string{
+		"garbage":           "not.a.token",
+		"a foreign key":     other.mint(t, nil),
+		"expired":           "",
+		"empty but present": " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, bearer, resolverCalls, seen := bearerAndGateServer(t, d)
+			value := assertion
+			if name == "expired" {
+				value = d.mint(t, func(c jwt.MapClaims) {
+					past := time.Now().Add(-10 * time.Minute)
+					c["iat"], c["exp"] = past.Unix(), past.Add(60*time.Second).Unix()
+				})
+			}
+			resp := bothCredentials(t, srv, bearer, value)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200: a %s assertion refused a valid Bearer request", resp.StatusCode, name)
+			}
+			if access := seen(); access == nil || access.AuthKind != AuthBearer {
+				t.Errorf("access = %+v, want a Bearer-authenticated one", access)
+			}
+			if *resolverCalls != 0 {
+				t.Errorf("the gate resolver ran %d times", *resolverCalls)
+			}
+		})
 	}
 }
