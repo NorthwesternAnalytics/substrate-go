@@ -58,14 +58,14 @@
 // with its own go.mod: nothing about it is PortfoliDEX-specific, and it does
 // not import anything from the PortfoliDEX module.
 //
-// It is here rather than in github.com/dextech/substrate-go because a new
+// It is here rather than in github.com/dextech-dev/substrate-go because a new
 // remote repository is a coordination step that would have blocked the whole
 // wave, and because the first importer needs to prove the API is right before
 // other backends are asked to depend on it. Graduating it later is small and
 // mechanical:
 //
 //   - move libs/substrate-go/ to the root of a new repository — the module
-//     path github.com/dextech/substrate-go is already correct, so no import in
+//     path github.com/dextech-dev/substrate-go is already correct, so no import in
 //     any consuming app changes;
 //   - tag it (v0.1.0);
 //   - in each consumer's go.mod, replace the `replace` directive with a

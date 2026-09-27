@@ -159,7 +159,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dextech/substrate-go/trust"
+	"github.com/dextech-dev/substrate-go/trust"
 )
 
 func main() {
