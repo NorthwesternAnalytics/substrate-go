@@ -2,8 +2,8 @@
 //
 // It lives inside the PortfoliDEX repository rather than in its own — see
 // trust/doc.go, "Where this module lives", for why, and for what graduating
-// it to github.com/dextech/substrate-go actually costs.
-module github.com/dextech/substrate-go
+// it to github.com/NorthwesternAnalytics/substrate-go actually costs.
+module github.com/NorthwesternAnalytics/substrate-go
 
 go 1.25.0
 

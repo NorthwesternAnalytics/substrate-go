@@ -70,14 +70,14 @@
 // with its own go.mod: nothing about it is PortfoliDEX-specific, and it does
 // not import anything from the PortfoliDEX module.
 //
-// It is here rather than in github.com/dextech-dev/substrate-go because a new
+// It is here rather than in github.com/NorthwesternAnalytics/substrate-go because a new
 // remote repository is a coordination step that would have blocked the whole
 // wave, and because the first importer needs to prove the API is right before
 // other backends are asked to depend on it. Graduating it later is small and
 // mechanical:
 //
 //   - move libs/substrate-go/ to the root of a new repository — the module
-//     path github.com/dextech-dev/substrate-go is already correct, so no import in
+//     path github.com/NorthwesternAnalytics/substrate-go is already correct, so no import in
 //     any consuming app changes;
 //   - tag it (v0.1.0);
 //   - in each consumer's go.mod, replace the `replace` directive with a
@@ -87,3 +87,14 @@
 // this package by relative path or vendoring it — both would silently recreate
 // the copy-paste problem this module exists to end.
 package trust
+
+// # Where this module used to live
+//
+// ARCHIVED: github.com/dextech/substrate-go
+// ARCHIVED: github.com/dextech-dev/substrate-go
+//
+// Retired, not reused. Where a repository existed at one of those paths it is
+// archived rather than deleted, so any tag published under it stays resolvable
+// for anything still pinning it; where none existed, nothing was ever published
+// there. New consumers require the path this module declares above, from v0.2.0
+// onwards.
